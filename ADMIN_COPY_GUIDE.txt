@@ -1,0 +1,333 @@
+TELEGRAM MOVIE BOT - COMPLETE COPY GUIDE FOR ADMIN
+================================================
+
+यह guide admin को complete bot copy करने के लिए है।
+
+QUICK SETUP (5 Minutes):
+1. New bot बनाएं @BotFather से
+2. नीचे दिए गए files copy करें
+3. Environment variables set करें
+4. Bot run करें
+
+REQUIRED ENVIRONMENT VARIABLES:
+BOT_TOKEN=your_bot_token_from_botfather
+ADMIN_IDS=your_admin_user_id
+INSHORT_API_KEY=your_inshort_api_key
+
+FILES TO CREATE:
+==============
+
+FILE 1: main.py
+--------------
+import os
+import logging
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+from bot_handlers import BotHandlers
+from database import Database
+from config import Config
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def main():
+    try:
+        db = Database()
+        db.init_db()
+        
+        bot_handlers = BotHandlers(db)
+        
+        application = Application.builder().token(Config.BOT_TOKEN).build()
+        
+        application.add_handler(CommandHandler("start", bot_handlers.start_command))
+        application.add_handler(CommandHandler("admin", bot_handlers.admin_command))
+        application.add_handler(CommandHandler("upload", bot_handlers.upload_command))
+        application.add_handler(CommandHandler("help", bot_handlers.help_command))
+        application.add_handler(CommandHandler("stats", bot_handlers.stats_command))
+        
+        application.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND, 
+            bot_handlers.handle_message
+        ))
+        application.add_handler(MessageHandler(
+            filters.Document.ALL | filters.VIDEO, 
+            bot_handlers.handle_file_upload
+        ))
+        
+        application.add_handler(CallbackQueryHandler(bot_handlers.handle_callback))
+        
+        logger.info("Starting Telegram Movie Bot...")
+        application.run_polling(allowed_updates=['message', 'callback_query'])
+        
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
+        raise
+
+if __name__ == "__main__":
+    main()
+
+FILE 2: config.py
+----------------
+import os
+
+class Config:
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+    
+    ADMIN_IDS = [
+        int(admin_id.strip()) 
+        for admin_id in os.getenv("ADMIN_IDS", "").split(",") 
+        if admin_id.strip().isdigit()
+    ]
+    
+    INSHORT_API_KEY = os.getenv("INSHORT_API_KEY", "")
+    INSHORT_API_URL = "https://inshorturl.com/api"
+    
+    MAX_FILE_SIZE = None
+    ALLOWED_FILE_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v']
+    AUTO_DELETE_MINUTES = 10
+    DATABASE_PATH = "movie_bot.db"
+    FUZZY_SEARCH_THRESHOLD = 60
+    MAX_SEARCH_RESULTS = 10
+    
+    WELCOME_MESSAGE = """
+🎬 Welcome to Movie Filter Bot!
+
+Search for movies by typing the name
+I'll find matches even with spelling mistakes
+Click on buttons to get direct download links
+Files will be sent to your DM instantly
+
+Commands:
+/help - Show help message
+"""
+    
+    HELP_MESSAGE = """
+🆘 Help & Instructions
+
+How to search:
+1. Type the movie/series name
+2. I'll show matching results with buttons
+3. Click on the button to get the file
+4. File will be sent to your DM
+
+Search Tips:
+• You can make spelling mistakes, I'll still find it!
+• Use keywords like "avengers", "season 1", "part 2"
+• Be specific for better results
+"""
+
+FILE 3: database.py
+------------------
+import sqlite3
+import logging
+from contextlib import contextmanager
+from typing import List, Dict, Optional
+from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
+
+class Database:
+    def __init__(self, db_path: str = "movie_bot.db"):
+        self.db_path = db_path
+        
+    @contextmanager
+    def get_connection(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+    
+    def init_db(self):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS movies (
+                    id INTEGER PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    year INTEGER,
+                    quality TEXT,
+                    part_season_episode TEXT,
+                    file_id TEXT UNIQUE NOT NULL,
+                    file_name TEXT NOT NULL,
+                    file_size INTEGER DEFAULT 0,
+                    original_url TEXT NOT NULL,
+                    shortened_url TEXT NOT NULL,
+                    uploaded_by INTEGER NOT NULL,
+                    upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    download_count INTEGER DEFAULT 0,
+                    is_active BOOLEAN DEFAULT 1
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS search_logs (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER,
+                    username TEXT,
+                    query TEXT,
+                    results_count INTEGER,
+                    search_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS download_logs (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER,
+                    username TEXT,
+                    movie_id INTEGER,
+                    download_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    auto_delete_time TIMESTAMP,
+                    is_deleted BOOLEAN DEFAULT 0
+                )
+            ''')
+            
+            conn.commit()
+            logger.info("Database initialized successfully")
+    
+    def add_movie(self, title: str, year: Optional[int], quality: str, 
+                  part_season_episode: str, file_id: str, file_name: str, 
+                  file_size: int, original_url: str, shortened_url: str, 
+                  uploaded_by: int) -> int:
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO movies (title, year, quality, part_season_episode, 
+                                 file_id, file_name, file_size, original_url, 
+                                 shortened_url, uploaded_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (title, year, quality, part_season_episode, file_id, 
+                  file_name, file_size, original_url, shortened_url, uploaded_by))
+            
+            movie_id = cursor.lastrowid
+            conn.commit()
+            return movie_id
+    
+    def search_movies(self, query: str, limit: int = 10) -> List[Dict]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            search_pattern = f"%{query}%"
+            
+            cursor.execute('''
+                SELECT * FROM movies 
+                WHERE is_active = 1 
+                AND (title LIKE ? OR quality LIKE ? OR part_season_episode LIKE ?)
+                ORDER BY download_count DESC, upload_date DESC
+                LIMIT ?
+            ''', (search_pattern, search_pattern, search_pattern, limit))
+            
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def get_movie_by_id(self, movie_id: int) -> Optional[Dict]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT * FROM movies WHERE id = ? AND is_active = 1', (movie_id,))
+            row = cursor.fetchone()
+            
+            return dict(row) if row else None
+    
+    def increment_download_count(self, movie_id: int):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('UPDATE movies SET download_count = download_count + 1 WHERE id = ?', (movie_id,))
+            conn.commit()
+    
+    def log_download(self, user_id: int, username: str, movie_id: int, auto_delete_minutes: int):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            auto_delete_time = datetime.now() + timedelta(minutes=auto_delete_minutes)
+            
+            cursor.execute('''
+                INSERT INTO download_logs (user_id, username, movie_id, auto_delete_time)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, username, movie_id, auto_delete_time))
+            
+            conn.commit()
+    
+    def save_user_info(self, user_id: int, username: str, first_name: str):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO users (user_id, username, first_name, last_updated)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (user_id, username, first_name))
+            
+            conn.commit()
+    
+    def get_stats(self) -> Dict:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('SELECT COUNT(*) FROM movies WHERE is_active = 1')
+            total_movies = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users')
+            total_users = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT SUM(download_count) FROM movies WHERE is_active = 1')
+            total_downloads = cursor.fetchone()[0] or 0
+            
+            return {
+                'total_movies': total_movies,
+                'total_users': total_users,
+                'total_downloads': total_downloads
+            }
+
+SETUP INSTRUCTIONS:
+==================
+
+1. Create new folder: mkdir movie-bot && cd movie-bot
+
+2. Create all above files (main.py, config.py, database.py)
+
+3. Install dependencies:
+   pip install python-telegram-bot[job-queue]==20.8 aiohttp fuzzywuzzy python-levenshtein
+
+4. Set environment variables:
+   export BOT_TOKEN="your_bot_token"
+   export ADMIN_IDS="your_user_id"  
+   export INSHORT_API_KEY="your_api_key"
+
+5. Run bot: python main.py
+
+6. Test in Telegram:
+   - /start command
+   - Upload files via /upload
+   - Search movies by typing names
+
+FEATURES:
+- Movie search with typo tolerance
+- Direct file download
+- Auto-delete after 10 minutes
+- Admin panel via /admin
+- Bulk upload support
+- User analytics
+- Rate limiting
+
+NOTE: You need to create remaining files (bot_handlers.py, utils.py, etc.) or copy them from current bot structure.
+
+For complete files, use /structure command in current bot or contact admin.
